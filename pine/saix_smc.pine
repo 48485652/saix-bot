@@ -1,0 +1,407 @@
+//@version=5
+// ══════════════════════════════════════════
+// 賽克斯 SMC 看盤輔助指標
+// 市場結構 BOS / CHoCH、訂單塊 OB、公允價值缺口 FVG、
+// 等高等低 EQH / EQL、溢價 / 折價區、高週期趨勢、OB 回踩訊號
+// 訊號可選擇送出與 server.py 相容的 Webhook JSON
+// ══════════════════════════════════════════
+indicator("賽克斯 SMC 看盤輔助", shorttitle = "SAIX SMC", overlay = true, max_bars_back = 1000, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ══════════════════════════════════════════
+// 輸入設定
+// ══════════════════════════════════════════
+GRP_MS  = "① 市場結構 (BOS / CHoCH)"
+swingLen   = input.int(10, "波段長度", minval = 2, maxval = 50, group = GRP_MS, tooltip = "左右各幾根 K 棒確認一個波段高 / 低點。數字越大，結構越大、訊號越少")
+showBOS    = input.bool(true, "顯示 BOS（結構延續）", group = GRP_MS)
+showCHoCH  = input.bool(true, "顯示 CHoCH（結構轉換）", group = GRP_MS)
+showSwings = input.bool(true, "標示 HH / HL / LH / LL", group = GRP_MS)
+bullCol    = input.color(#089981, "多方", group = GRP_MS, inline = "col")
+bearCol    = input.color(#F23645, "空方", group = GRP_MS, inline = "col")
+
+GRP_OB  = "② 訂單塊 Order Block"
+showOB       = input.bool(true, "顯示訂單塊", group = GRP_OB)
+obMax        = input.int(5, "每個方向最多保留", minval = 1, maxval = 20, group = GRP_OB)
+obMitigation = input.string("收盤價", "失效判定", options = ["收盤價", "影線"], group = GRP_OB, tooltip = "收盤價：收盤跌破 / 突破才算失效；影線：碰到就失效")
+obBullCol    = input.color(color.new(#089981, 80), "多方 OB", group = GRP_OB, inline = "ob")
+obBearCol    = input.color(color.new(#F23645, 80), "空方 OB", group = GRP_OB, inline = "ob")
+
+GRP_FVG = "③ 公允價值缺口 FVG"
+showFVG    = input.bool(true, "顯示 FVG", group = GRP_FVG)
+fvgMinATR  = input.float(0.2, "最小缺口 (ATR 倍數)", minval = 0, step = 0.05, group = GRP_FVG, tooltip = "過濾太小的缺口，0 = 全部顯示")
+fvgMax     = input.int(10, "最多保留", minval = 1, maxval = 50, group = GRP_FVG)
+fvgBullCol = input.color(color.new(#2962FF, 80), "多方 FVG", group = GRP_FVG, inline = "fvg")
+fvgBearCol = input.color(color.new(#FF9800, 80), "空方 FVG", group = GRP_FVG, inline = "fvg")
+
+GRP_EQ  = "④ 流動性 EQH / EQL"
+showEQ   = input.bool(true, "顯示等高 / 等低", group = GRP_EQ)
+eqLen    = input.int(5, "確認長度", minval = 2, maxval = 50, group = GRP_EQ)
+eqThresh = input.float(0.1, "容許誤差 (ATR 倍數)", minval = 0.01, step = 0.01, group = GRP_EQ)
+
+GRP_PD  = "⑤ 溢價 / 折價區"
+showPD = input.bool(true, "顯示 Premium / Discount", group = GRP_PD)
+
+GRP_HTF = "⑥ 高週期趨勢"
+htfTF  = input.timeframe("240", "高週期", group = GRP_HTF, tooltip = "請選比圖表週期更大的週期")
+htfLen = input.int(10, "高週期波段長度", minval = 2, maxval = 50, group = GRP_HTF)
+
+GRP_SIG = "⑦ 進場訊號（OB 回踩）"
+showSig     = input.bool(true, "顯示訊號", group = GRP_SIG)
+needZone    = input.bool(true, "做多須在折價區 / 做空須在溢價區", group = GRP_SIG)
+needHTF     = input.bool(false, "須與高週期趨勢同向", group = GRP_SIG)
+slBufATR    = input.float(0.1, "停損緩衝 (ATR 倍數)", minval = 0, step = 0.05, group = GRP_SIG, tooltip = "停損放在 OB 外側再多留一點距離")
+rr          = input.float(1.0, "圖上止盈 R 倍數", minval = 0.5, step = 0.5, group = GRP_SIG, tooltip = "只影響圖上顯示；server.py 下單固定用 1:1")
+sendWebhook = input.bool(false, "送出自動交易 JSON（賽克斯 bot）", group = GRP_SIG, tooltip = "開啟後，建立警報時選「任何 alert() 函數呼叫」，訊號就會以 server.py 的格式送出並真的下單。請先確認再開！")
+
+GRP_UI  = "⑧ 資訊面板"
+showDash = input.bool(true, "顯示資訊面板", group = GRP_UI)
+dashPos  = input.string("右上", "位置", options = ["右上", "右下", "左上", "左下"], group = GRP_UI)
+
+// ══════════════════════════════════════════
+// 資料型別
+// ══════════════════════════════════════════
+type OrderBlock
+    float top
+    float btm
+    box   bx
+    bool  used = false
+
+type Gap
+    float top
+    float btm
+    box   bx
+    bool  bull
+
+// ══════════════════════════════════════════
+// 工具函式
+// ══════════════════════════════════════════
+atr = ta.atr(14)
+
+drawStructure(int x1, float y, string txt, color col, bool up) =>
+    line.new(x1, y, bar_index, y, color = col, style = txt == "BOS" ? line.style_solid : line.style_dashed)
+    label.new(math.round((x1 + bar_index) / 2), y, txt, color = color(na), textcolor = col, style = up ? label.style_label_down : label.style_label_up, size = size.small)
+
+deleteBox(box b) =>
+    if not na(b)
+        box.delete(b)
+
+// 高週期結構趨勢：1 = 多、-1 = 空、0 = 未定
+structureTrend(int len) =>
+    var int   t = 0
+    var float h = na
+    var float l = na
+    pH = ta.pivothigh(high, len, len)
+    pL = ta.pivotlow(low, len, len)
+    if not na(pH)
+        h := pH
+    if not na(pL)
+        l := pL
+    if not na(h) and close > h
+        t := 1
+        h := na
+    if not na(l) and close < l
+        t := -1
+        l := na
+    t
+
+// 組出 server.py 需要的 JSON
+webhookJson(string side, float entry, float sl, bool aligned) =>
+    slPct  = math.abs(entry - sl) / entry * 100
+    symbol = str.replace_all(syminfo.ticker, ".P", "")
+    '{"symbol":"' + symbol + '","side":"' + side + '","entry":' + str.tostring(entry, format.mintick) + ',"sl":' + str.tostring(sl, format.mintick) + ',"sl_pct":' + str.tostring(slPct, "#.####") + ',"trend_aligned":' + (aligned ? "true" : "false") + '}'
+
+trendText(int t) =>
+    t == 1 ? "多頭 ▲" : t == -1 ? "空頭 ▼" : "未定 —"
+
+trendColor(int t) =>
+    t == 1 ? bullCol : t == -1 ? bearCol : color.gray
+
+// ══════════════════════════════════════════
+// 高週期趨勢（不重繪寫法）
+// ══════════════════════════════════════════
+htfTrend = nz(request.security(syminfo.tickerid, htfTF, structureTrend(htfLen)[1], lookahead = barmerge.lookahead_on))
+
+// ══════════════════════════════════════════
+// 狀態
+// ══════════════════════════════════════════
+var float swHigh      = na
+var int   swHighBar   = na
+var bool  swHighBrk   = true
+var float swLow       = na
+var int   swLowBar    = na
+var bool  swLowBrk    = true
+var int   trend       = 0
+var float trailTop    = na
+var int   trailTopBar = na
+var float trailBtm    = na
+var int   trailBtmBar = na
+var string lastEvent  = "—"
+
+var bullOBs = array.new<OrderBlock>()
+var bearOBs = array.new<OrderBlock>()
+var gaps    = array.new<Gap>()
+
+// ══════════════════════════════════════════
+// 1. 波段高低點
+// ══════════════════════════════════════════
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+if not na(ph)
+    if showSwings
+        txt = na(swHigh) ? "H" : ph > swHigh ? "HH" : "LH"
+        label.new(bar_index - swingLen, ph, txt, color = color(na), textcolor = color.gray, style = label.style_label_down, size = size.tiny)
+    swHigh      := ph
+    swHighBar   := bar_index - swingLen
+    swHighBrk   := false
+    trailTop    := ph
+    trailTopBar := bar_index - swingLen
+
+if not na(pl)
+    if showSwings
+        txt = na(swLow) ? "L" : pl < swLow ? "LL" : "HL"
+        label.new(bar_index - swingLen, pl, txt, color = color(na), textcolor = color.gray, style = label.style_label_up, size = size.tiny)
+    swLow       := pl
+    swLowBar    := bar_index - swingLen
+    swLowBrk    := false
+    trailBtm    := pl
+    trailBtmBar := bar_index - swingLen
+
+// 追蹤目前區間的最高 / 最低（給溢價 / 折價區用）
+if not na(trailTop) and high > trailTop
+    trailTop    := high
+    trailTopBar := bar_index
+if not na(trailBtm) and low < trailBtm
+    trailBtm    := low
+    trailBtmBar := bar_index
+
+eq         = (trailTop + trailBtm) / 2
+inPremium  = close > eq
+inDiscount = close < eq
+
+// ══════════════════════════════════════════
+// 2. 訂單塊失效檢查
+// ══════════════════════════════════════════
+bullSrc = obMitigation == "收盤價" ? close : low
+bearSrc = obMitigation == "收盤價" ? close : high
+
+if bullOBs.size() > 0
+    for i = bullOBs.size() - 1 to 0
+        ob = bullOBs.get(i)
+        if bullSrc < ob.btm
+            deleteBox(ob.bx)
+            bullOBs.remove(i)
+
+if bearOBs.size() > 0
+    for i = bearOBs.size() - 1 to 0
+        ob = bearOBs.get(i)
+        if bearSrc > ob.top
+            deleteBox(ob.bx)
+            bearOBs.remove(i)
+
+// ══════════════════════════════════════════
+// 3. OB 回踩訊號（只在 K 棒收盤確認）
+// ══════════════════════════════════════════
+longSig  = false
+shortSig = false
+float longSL  = na
+float shortSL = na
+
+if barstate.isconfirmed and trend == 1 and bullOBs.size() > 0 and (not needZone or inDiscount) and (not needHTF or htfTrend == 1)
+    for i = bullOBs.size() - 1 to 0
+        ob = bullOBs.get(i)
+        if not ob.used and low <= ob.top and close > ob.btm
+            ob.used := true
+            longSig := true
+            longSL  := ob.btm - slBufATR * atr
+            break
+
+if barstate.isconfirmed and trend == -1 and bearOBs.size() > 0 and (not needZone or inPremium) and (not needHTF or htfTrend == -1)
+    for i = bearOBs.size() - 1 to 0
+        ob = bearOBs.get(i)
+        if not ob.used and high >= ob.btm and close < ob.top
+            ob.used  := true
+            shortSig := true
+            shortSL  := ob.top + slBufATR * atr
+            break
+
+if longSig
+    risk = close - longSL
+    tp   = close + risk * rr
+    if showSig
+        label.new(bar_index, low, "做多\n損 " + str.tostring(longSL, format.mintick) + "\n盈 " + str.tostring(tp, format.mintick), color = bullCol, textcolor = color.white, style = label.style_label_up, size = size.small)
+    if sendWebhook
+        alert(webhookJson("buy", close, longSL, htfTrend == 1), alert.freq_once_per_bar_close)
+
+if shortSig
+    risk = shortSL - close
+    tp   = close - risk * rr
+    if showSig
+        label.new(bar_index, high, "做空\n損 " + str.tostring(shortSL, format.mintick) + "\n盈 " + str.tostring(tp, format.mintick), color = bearCol, textcolor = color.white, style = label.style_label_down, size = size.small)
+    if sendWebhook
+        alert(webhookJson("sell", close, shortSL, htfTrend == -1), alert.freq_once_per_bar_close)
+
+// ══════════════════════════════════════════
+// 4. 結構突破 BOS / CHoCH + 建立訂單塊
+// ══════════════════════════════════════════
+bullBreak = not swHighBrk and close > swHigh
+bearBreak = not swLowBrk and close < swLow
+bullChoch = bullBreak and trend == -1
+bearChoch = bearBreak and trend == 1
+
+if bullBreak
+    swHighBrk := true
+    tag = bullChoch ? "CHoCH" : "BOS"
+    lastEvent := "多方 " + tag
+    if (bullChoch and showCHoCH) or (not bullChoch and showBOS)
+        drawStructure(swHighBar, swHigh, tag, bullCol, true)
+    // 多方 OB：突破前這段走勢中最低的那根 K 棒
+    n    = math.min(bar_index - swHighBar, 500)
+    idx  = 1
+    minL = low[1]
+    for i = 2 to n
+        if low[i] < minL
+            minL := low[i]
+            idx  := i
+    ob = OrderBlock.new(high[idx], low[idx], na)
+    if showOB
+        ob.bx := box.new(bar_index - idx, ob.top, bar_index, ob.btm, border_color = color.new(bullCol, 50), bgcolor = obBullCol, extend = extend.right, text = "Bull OB", text_color = bullCol, text_size = size.tiny, text_halign = text.align_right)
+    bullOBs.push(ob)
+    if bullOBs.size() > obMax
+        deleteBox(bullOBs.shift().bx)
+    trend := 1
+
+if bearBreak
+    swLowBrk := true
+    tag = bearChoch ? "CHoCH" : "BOS"
+    lastEvent := "空方 " + tag
+    if (bearChoch and showCHoCH) or (not bearChoch and showBOS)
+        drawStructure(swLowBar, swLow, tag, bearCol, false)
+    // 空方 OB：跌破前這段走勢中最高的那根 K 棒
+    n    = math.min(bar_index - swLowBar, 500)
+    idx  = 1
+    maxH = high[1]
+    for i = 2 to n
+        if high[i] > maxH
+            maxH := high[i]
+            idx  := i
+    ob = OrderBlock.new(high[idx], low[idx], na)
+    if showOB
+        ob.bx := box.new(bar_index - idx, ob.top, bar_index, ob.btm, border_color = color.new(bearCol, 50), bgcolor = obBearCol, extend = extend.right, text = "Bear OB", text_color = bearCol, text_size = size.tiny, text_halign = text.align_right)
+    bearOBs.push(ob)
+    if bearOBs.size() > obMax
+        deleteBox(bearOBs.shift().bx)
+    trend := -1
+
+// ══════════════════════════════════════════
+// 5. 公允價值缺口 FVG
+// ══════════════════════════════════════════
+if showFVG
+    // 更新舊缺口：被回補就縮小，完全回補就刪除
+    if gaps.size() > 0
+        for i = gaps.size() - 1 to 0
+            g = gaps.get(i)
+            filled = g.bull ? low <= g.btm : high >= g.top
+            if filled
+                box.delete(g.bx)
+                gaps.remove(i)
+            else
+                if g.bull and low < g.top
+                    g.top := low
+                    box.set_top(g.bx, low)
+                if not g.bull and high > g.btm
+                    g.btm := high
+                    box.set_bottom(g.bx, high)
+                box.set_right(g.bx, bar_index + 5)
+
+    bullGap = low > high[2] and close[1] > high[2] and (low - high[2]) >= fvgMinATR * atr
+    bearGap = high < low[2] and close[1] < low[2] and (low[2] - high) >= fvgMinATR * atr
+    if bullGap
+        gaps.push(Gap.new(low, high[2], box.new(bar_index - 2, low, bar_index + 5, high[2], border_color = color(na), bgcolor = fvgBullCol, text = "FVG", text_color = color.new(#2962FF, 30), text_size = size.tiny), true))
+    if bearGap
+        gaps.push(Gap.new(low[2], high, box.new(bar_index - 2, low[2], bar_index + 5, high, border_color = color(na), bgcolor = fvgBearCol, text = "FVG", text_color = color.new(#FF9800, 30), text_size = size.tiny), false))
+    if gaps.size() > fvgMax
+        box.delete(gaps.shift().bx)
+
+// ══════════════════════════════════════════
+// 6. 流動性：等高 EQH / 等低 EQL
+// ══════════════════════════════════════════
+eph = ta.pivothigh(high, eqLen, eqLen)
+epl = ta.pivotlow(low, eqLen, eqLen)
+var float lastEH    = na
+var int   lastEHBar = na
+var float lastEL    = na
+var int   lastELBar = na
+
+if not na(eph)
+    x2 = bar_index - eqLen
+    if showEQ and not na(lastEH) and math.abs(eph - lastEH) < eqThresh * atr
+        line.new(lastEHBar, lastEH, x2, eph, color = bearCol, style = line.style_dotted)
+        label.new(math.round((lastEHBar + x2) / 2), math.max(eph, lastEH), "EQH", color = color(na), textcolor = bearCol, style = label.style_label_down, size = size.tiny)
+    lastEH    := eph
+    lastEHBar := x2
+
+if not na(epl)
+    x2 = bar_index - eqLen
+    if showEQ and not na(lastEL) and math.abs(epl - lastEL) < eqThresh * atr
+        line.new(lastELBar, lastEL, x2, epl, color = bullCol, style = line.style_dotted)
+        label.new(math.round((lastELBar + x2) / 2), math.min(epl, lastEL), "EQL", color = color(na), textcolor = bullCol, style = label.style_label_up, size = size.tiny)
+    lastEL    := epl
+    lastELBar := x2
+
+// ══════════════════════════════════════════
+// 7. 溢價 / 折價區（只畫在最後一根）
+// ══════════════════════════════════════════
+var box   premBox = na
+var box   discBox = na
+var line  eqLine  = na
+var label eqLabel = na
+
+if showPD and barstate.islast and not na(trailTop) and not na(trailBtm)
+    deleteBox(premBox)
+    deleteBox(discBox)
+    line.delete(eqLine)
+    label.delete(eqLabel)
+    left  = math.min(trailTopBar, trailBtmBar)
+    right = bar_index + 20
+    premBox := box.new(left, trailTop, right, eq, border_color = color(na), bgcolor = color.new(bearCol, 92), text = "溢價 Premium（找空）", text_color = color.new(bearCol, 40), text_size = size.small, text_valign = text.align_top, text_halign = text.align_right)
+    discBox := box.new(left, eq, right, trailBtm, border_color = color(na), bgcolor = color.new(bullCol, 92), text = "折價 Discount（找多）", text_color = color.new(bullCol, 40), text_size = size.small, text_valign = text.align_bottom, text_halign = text.align_right)
+    eqLine  := line.new(left, eq, right, eq, color = color.gray, style = line.style_dashed)
+    eqLabel := label.new(right, eq, "EQ 50%", color = color(na), textcolor = color.gray, style = label.style_label_left, size = size.tiny)
+
+// ══════════════════════════════════════════
+// 8. 資訊面板
+// ══════════════════════════════════════════
+tablePos = switch dashPos
+    "右上" => position.top_right
+    "右下" => position.bottom_right
+    "左上" => position.top_left
+    => position.bottom_left
+
+var table dash = table.new(tablePos, 2, 6, bgcolor = color.new(#131722, 10), border_color = color.new(color.gray, 70), border_width = 1)
+
+if showDash and barstate.islast
+    zoneTxt = na(eq) ? "—" : inPremium ? "溢價區（偏空）" : "折價區（偏多）"
+    zoneCol = na(eq) ? color.gray : inPremium ? bearCol : bullCol
+    aligned = trend != 0 and trend == htfTrend
+    table.cell(dash, 0, 0, "SAIX SMC", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, syminfo.ticker, text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 1, "本週期結構", text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 1, trendText(trend), text_color = trendColor(trend), text_size = size.small)
+    table.cell(dash, 0, 2, "高週期 " + htfTF, text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 2, trendText(htfTrend), text_color = trendColor(htfTrend), text_size = size.small)
+    table.cell(dash, 0, 3, "多週期共振", text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 3, aligned ? "同向 ✔" : "不同向 ✘", text_color = aligned ? bullCol : color.orange, text_size = size.small)
+    table.cell(dash, 0, 4, "價格位置", text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 4, zoneTxt, text_color = zoneCol, text_size = size.small)
+    table.cell(dash, 0, 5, "最近結構", text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 5, lastEvent, text_color = color.white, text_size = size.small)
+
+// ══════════════════════════════════════════
+// 警報條件（一般通知用，建議選「K 棒收盤時」）
+// ══════════════════════════════════════════
+alertcondition(bullChoch, "多方 CHoCH", "SMC：{{ticker}} 出現多方 CHoCH（趨勢可能轉多）")
+alertcondition(bearChoch, "空方 CHoCH", "SMC：{{ticker}} 出現空方 CHoCH（趨勢可能轉空）")
+alertcondition(bullBreak and not bullChoch, "多方 BOS", "SMC：{{ticker}} 多方 BOS（多頭延續）")
+alertcondition(bearBreak and not bearChoch, "空方 BOS", "SMC：{{ticker}} 空方 BOS（空頭延續）")
+alertcondition(longSig, "做多訊號（OB 回踩）", "SMC：{{ticker}} 回踩多方 OB，收盤 {{close}}")
+alertcondition(shortSig, "做空訊號（OB 回踩）", "SMC：{{ticker}} 回踩空方 OB，收盤 {{close}}")
