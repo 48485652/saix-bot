@@ -1,0 +1,431 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════
+// 賽克斯 SMC 全方位指標（SAIX SMC Suite）
+//
+// 功能：
+//   ① 市場結構：波段 / 內部 BOS、CHoCH
+//   ② 訂單塊 Order Block：自動產生，被收盤突破就移除
+//   ③ 公平價值缺口 FVG：自動縮小到剩餘缺口，補滿就移除
+//   ④ 流動性：等高 / 等低（EQH / EQL）、掃高 / 掃低（Sweep）
+//   ⑤ 溢價區 / 折價區 / 平衡線、前日與前週高低點
+//   ⑥ 大週期（HTF）趨勢，判斷是否同向
+//   ⑦ 交易信號 + Webhook JSON，直接對接 server.py（OKX 自動下單）
+//
+// 對接機器人：
+//   建立警報 → 條件選「賽克斯 SMC」→「任何 alert() 函式呼叫」
+//   Webhook 網址：https://<你的網域>/webhook?secret=<WEBHOOK_SECRET>
+//   訊息內容留空即可（指標會自己送出 JSON）
+// ══════════════════════════════════════════════════════════════
+indicator("賽克斯 SMC 全方位指標", "SAIX SMC", overlay = true, max_bars_back = 500, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ─────────────────────────── 輸入 ───────────────────────────
+const string G_STR  = "① 市場結構"
+const string G_OB   = "② 訂單塊 Order Block"
+const string G_FVG  = "③ 公平價值缺口 FVG"
+const string G_LIQ  = "④ 流動性"
+const string G_ZONE = "⑤ 溢價 / 折價 / 關鍵價位"
+const string G_SIG  = "⑥ 交易信號（對接 OKX 機器人）"
+const string G_UI   = "⑦ 外觀"
+
+showSwing      = input.bool(true, "顯示波段結構 (Swing)", group = G_STR)
+swingLen       = input.int(20, "波段長度", minval = 5, maxval = 100, group = G_STR)
+showInternal   = input.bool(true, "顯示內部結構 (Internal)", group = G_STR)
+internalLen    = input.int(5, "內部長度", minval = 2, maxval = 20, group = G_STR)
+htfTf          = input.timeframe("240", "大週期 (HTF)", group = G_STR)
+htfLen         = input.int(10, "大週期結構長度", minval = 2, maxval = 50, group = G_STR)
+
+showOB         = input.bool(true, "顯示訂單塊", group = G_OB)
+obFromInternal = input.bool(true, "內部結構突破也產生訂單塊", group = G_OB)
+obMax          = input.int(5, "每個方向最多保留", minval = 1, maxval = 20, group = G_OB)
+
+showFVG        = input.bool(true, "顯示 FVG", group = G_FVG)
+fvgAtr         = input.float(0.25, "最小缺口（ATR 倍數）", minval = 0, step = 0.05, group = G_FVG)
+fvgMax         = input.int(10, "最多保留", minval = 1, maxval = 50, group = G_FVG)
+
+showEq         = input.bool(true, "顯示等高 / 等低 (EQH / EQL)", group = G_LIQ)
+eqLen          = input.int(5, "等高等低偵測長度", minval = 2, maxval = 20, group = G_LIQ)
+eqThr          = input.float(0.1, "容許誤差（ATR 倍數）", minval = 0.01, step = 0.01, group = G_LIQ)
+showSweep      = input.bool(true, "顯示流動性掃蕩 (Sweep)", group = G_LIQ)
+
+showPD         = input.bool(true, "顯示溢價 / 折價區", group = G_ZONE)
+showLevels     = input.bool(true, "顯示前日 / 前週高低點", group = G_ZONE)
+
+sigOn          = input.bool(true, "啟用交易信號", group = G_SIG)
+sigTrend       = input.bool(true, "只順波段趨勢", group = G_SIG)
+sigZone        = input.bool(true, "做多只在折價區、做空只在溢價區", group = G_SIG)
+sigHtfOnly     = input.bool(false, "只在大週期同向時發信號", group = G_SIG)
+slBuffer       = input.float(0.1, "停損緩衝（ATR 倍數）", minval = 0, step = 0.05, group = G_SIG)
+minSlPct       = input.float(0.2, "最小停損 %", minval = 0.01, step = 0.05, group = G_SIG, tooltip = "停損太小 → 槓桿會被拉到上限，建議不要低於 0.2%")
+maxSlPct       = input.float(5.0, "最大停損 %", minval = 0.1, step = 0.1, group = G_SIG)
+
+bullCol        = input.color(#089981, "多方顏色", group = G_UI)
+bearCol        = input.color(#f23645, "空方顏色", group = G_UI)
+showDash       = input.bool(true, "顯示儀表板", group = G_UI)
+
+// ─────────────────────────── 資料型別 ───────────────────────────
+type Pivot
+    float price
+    int   bar
+    bool  crossed = false
+    bool  swept   = false
+
+type Structure
+    Pivot hi
+    Pivot lo
+    int   trend = 0
+
+type Zone
+    float top
+    float btm
+    int   dir
+    int   born
+    box   bx
+    bool  used = false
+
+float atr = ta.atr(200)
+
+// ─────────────────────────── 函式 ───────────────────────────
+// 偵測新的轉折高 / 低點
+f_updatePivots(Structure s, int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+    if not na(ph)
+        s.hi := Pivot.new(ph, bar_index - len)
+    if not na(pl)
+        s.lo := Pivot.new(pl, bar_index - len)
+    [ph, pl]
+
+// 結構突破：1 = 多方 BOS，2 = 多方 CHoCH，-1 = 空方 BOS，-2 = 空方 CHoCH
+f_break(Structure s) =>
+    int sig = 0
+    if not na(s.hi.price) and not s.hi.crossed and close > s.hi.price
+        s.hi.crossed := true
+        sig := s.trend < 0 ? 2 : 1
+        s.trend := 1
+    else if not na(s.lo.price) and not s.lo.crossed and close < s.lo.price
+        s.lo.crossed := true
+        sig := s.trend > 0 ? -2 : -1
+        s.trend := -1
+    sig
+
+f_drawStructure(Pivot p, bool bull, string tag, bool internal) =>
+    color c = bull ? bullCol : bearCol
+    line.new(p.bar, p.price, bar_index, p.price, color = c, style = internal ? line.style_dashed : line.style_solid, width = internal ? 1 : 2)
+    label.new(int(math.avg(p.bar, bar_index)), p.price, tag, color = color(na), textcolor = c, style = bull ? label.style_label_down : label.style_label_up, size = internal ? size.tiny : size.small)
+    true
+
+// 在轉折點到突破之間，找出最後一根反向 K 棒（多方找最低、空方找最高）
+f_findOB(int fromBar, bool bull) =>
+    int span = math.min(bar_index - fromBar, 400)
+    int idx = 1
+    if span > 1
+        for i = 2 to span
+            if bull ? low[i] < low[idx] : high[i] > high[idx]
+                idx := i
+    [high[idx], low[idx], bar_index - idx]
+
+f_addZone(array<Zone> arr, float top, float btm, int left, int dir, color col, string txt, int maxN, bool show, int transp) =>
+    box b = box.new(left, top, bar_index + 5, btm, border_color = show ? color.new(col, 50) : color(na), bgcolor = show ? color.new(col, transp) : color(na), text = show ? txt : "", text_color = color.new(col, 20), text_size = size.tiny, text_halign = text.align_right)
+    arr.unshift(Zone.new(top, btm, dir, bar_index, b))
+    if arr.size() > maxN
+        Zone old = arr.pop()
+        old.bx.delete()
+    arr.size()
+
+// 訂單塊：被收盤價突破就移除，其餘往右延伸
+f_updateOB(array<Zone> arr) =>
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            Zone z = arr.get(i)
+            bool broken = z.dir == 1 ? close < z.btm : close > z.top
+            if broken
+                arr.remove(i)
+                z.bx.delete()
+            else
+                z.bx.set_right(bar_index + 5)
+    arr.size()
+
+// FVG：被部分回補就縮小，完全補滿就移除
+f_updateFVG(array<Zone> arr) =>
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            Zone z = arr.get(i)
+            bool filled = z.dir == 1 ? low <= z.btm : high >= z.top
+            if filled
+                arr.remove(i)
+                z.bx.delete()
+            else
+                if z.dir == 1 and low < z.top
+                    z.top := low
+                    z.bx.set_top(low)
+                if z.dir == -1 and high > z.btm
+                    z.btm := high
+                    z.bx.set_bottom(high)
+                z.bx.set_right(bar_index + 5)
+    arr.size()
+
+// 價格第一次回到訂單塊：標記為已使用，回傳最新的那一個
+f_touch(array<Zone> arr) =>
+    Zone hit = na
+    for z in arr
+        if not z.used and bar_index > z.born and (z.dir == 1 ? low <= z.top : high >= z.btm)
+            z.used := true
+            if showOB
+                z.bx.set_bgcolor(color.new(z.dir == 1 ? bullCol : bearCol, 93))
+            if na(hit)
+                hit := z
+    hit
+
+// 大週期趨勢（回傳上一根已收盤 K 棒的結果，不重繪）
+f_htfTrend(int len) =>
+    var int   t      = 0
+    var float lastHi = na
+    var float lastLo = na
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+    if not na(ph)
+        lastHi := ph
+    if not na(pl)
+        lastLo := pl
+    if not na(lastHi) and close > lastHi
+        t := 1
+        lastHi := na
+    if not na(lastLo) and close < lastLo
+        t := -1
+        lastLo := na
+    nz(t[1])
+
+f_json(string side, float entry, float sl, bool aligned) =>
+    float  slPct = math.abs(entry - sl) / entry * 100
+    string sym   = syminfo.basecurrency + syminfo.currency   // BTCUSDT.P → BTCUSDT
+    '{"symbol":"' + sym + '","side":"' + side + '","entry":' + str.tostring(entry, "#.##########") + ',"sl":' + str.tostring(sl, "#.##########") + ',"sl_pct":' + str.tostring(slPct, "#.####") + ',"trend_aligned":' + (aligned ? "true" : "false") + '}'
+
+f_trendTxt(int t) => t == 1 ? "▲ 多頭" : t == -1 ? "▼ 空頭" : "—"
+f_trendCol(int t) => t == 1 ? bullCol : t == -1 ? bearCol : color.gray
+
+// ─────────────────────────── 市場結構 ───────────────────────────
+var Structure sw = Structure.new(Pivot.new(), Pivot.new())
+var Structure it = Structure.new(Pivot.new(), Pivot.new())
+
+[swPH, swPL] = f_updatePivots(sw, swingLen)
+[itPH, itPL] = f_updatePivots(it, internalLen)
+
+int swSig = f_break(sw)
+int itSig = f_break(it)
+
+int htfTrend = request.security(syminfo.tickerid, htfTf, f_htfTrend(htfLen), lookahead = barmerge.lookahead_on)
+
+// ─────────────────────────── 訂單塊 ───────────────────────────
+var array<Zone> bullOB = array.new<Zone>()
+var array<Zone> bearOB = array.new<Zone>()
+
+f_updateOB(bullOB)
+f_updateOB(bearOB)
+
+if swSig != 0
+    bool  bull = swSig > 0
+    Pivot p    = bull ? sw.hi : sw.lo
+    if showSwing
+        f_drawStructure(p, bull, math.abs(swSig) == 2 ? "CHoCH" : "BOS", false)
+    [obTop, obBtm, obLeft] = f_findOB(p.bar, bull)
+    f_addZone(bull ? bullOB : bearOB, obTop, obBtm, obLeft, bull ? 1 : -1, bull ? bullCol : bearCol, bull ? "Bull OB" : "Bear OB", obMax, showOB, 82)
+
+if itSig != 0
+    bool  bull = itSig > 0
+    Pivot p    = bull ? it.hi : it.lo
+    if showInternal
+        f_drawStructure(p, bull, math.abs(itSig) == 2 ? "iCHoCH" : "iBOS", true)
+    if obFromInternal
+        [obTop, obBtm, obLeft] = f_findOB(p.bar, bull)
+        f_addZone(bull ? bullOB : bearOB, obTop, obBtm, obLeft, bull ? 1 : -1, bull ? bullCol : bearCol, "iOB", obMax, showOB, 88)
+
+// ─────────────────────────── FVG ───────────────────────────
+var array<Zone> fvgs = array.new<Zone>()
+f_updateFVG(fvgs)
+
+float gapMin  = nz(atr) * fvgAtr
+bool  bullGap = low > high[2] and close[1] > high[2] and low - high[2] > gapMin
+bool  bearGap = high < low[2] and close[1] < low[2] and low[2] - high > gapMin
+if bullGap
+    f_addZone(fvgs, low, high[2], bar_index - 2, 1, bullCol, "FVG", fvgMax, showFVG, 90)
+if bearGap
+    f_addZone(fvgs, low[2], high, bar_index - 2, -1, bearCol, "FVG", fvgMax, showFVG, 90)
+
+// ─────────────────────────── 流動性 ───────────────────────────
+// 掃高 / 掃低：影線刺穿波段高低點，但收盤收回來
+bool sweepHi = false
+bool sweepLo = false
+if not na(sw.hi.price) and not sw.hi.crossed and not sw.hi.swept and high > sw.hi.price and close < sw.hi.price
+    sw.hi.swept := true
+    sweepHi     := true
+    if showSweep
+        line.new(sw.hi.bar, sw.hi.price, bar_index, sw.hi.price, color = color.new(bearCol, 40), style = line.style_dotted)
+        label.new(bar_index, high, "掃高", color = color(na), textcolor = bearCol, style = label.style_label_down, size = size.small)
+if not na(sw.lo.price) and not sw.lo.crossed and not sw.lo.swept and low < sw.lo.price and close > sw.lo.price
+    sw.lo.swept := true
+    sweepLo     := true
+    if showSweep
+        line.new(sw.lo.bar, sw.lo.price, bar_index, sw.lo.price, color = color.new(bullCol, 40), style = line.style_dotted)
+        label.new(bar_index, low, "掃低", color = color(na), textcolor = bullCol, style = label.style_label_up, size = size.small)
+
+// 等高 / 等低
+float eqPH = ta.pivothigh(high, eqLen, eqLen)
+float eqPL = ta.pivotlow(low, eqLen, eqLen)
+var float lastEqH    = na
+var int   lastEqHBar = na
+var float lastEqL    = na
+var int   lastEqLBar = na
+if not na(eqPH)
+    if showEq and not na(lastEqH) and math.abs(eqPH - lastEqH) < nz(atr) * eqThr
+        line.new(lastEqHBar, lastEqH, bar_index - eqLen, eqPH, color = bearCol, style = line.style_dotted)
+        label.new(int(math.avg(lastEqHBar, bar_index - eqLen)), math.max(eqPH, lastEqH), "EQH", color = color(na), textcolor = bearCol, style = label.style_label_down, size = size.tiny)
+    lastEqH    := eqPH
+    lastEqHBar := bar_index - eqLen
+if not na(eqPL)
+    if showEq and not na(lastEqL) and math.abs(eqPL - lastEqL) < nz(atr) * eqThr
+        line.new(lastEqLBar, lastEqL, bar_index - eqLen, eqPL, color = bullCol, style = line.style_dotted)
+        label.new(int(math.avg(lastEqLBar, bar_index - eqLen)), math.min(eqPL, lastEqL), "EQL", color = color(na), textcolor = bullCol, style = label.style_label_up, size = size.tiny)
+    lastEqL    := eqPL
+    lastEqLBar := bar_index - eqLen
+
+// ─────────────────────────── 溢價 / 折價 ───────────────────────────
+var float rTop    = na
+var float rBtm    = na
+var int   rTopBar = na
+var int   rBtmBar = na
+if not na(swPH)
+    rTop    := swPH
+    rTopBar := bar_index - swingLen
+if not na(swPL)
+    rBtm    := swPL
+    rBtmBar := bar_index - swingLen
+if not na(rTop) and high > rTop
+    rTop    := high
+    rTopBar := bar_index
+if not na(rBtm) and low < rBtm
+    rBtm    := low
+    rBtmBar := bar_index
+float eq = (rTop + rBtm) / 2
+
+var box  premBox = na
+var box  discBox = na
+var line eqLine  = na
+if showPD and barstate.islast and not na(eq)
+    int l = math.min(rTopBar, rBtmBar)
+    int r = bar_index + 20
+    if na(premBox)
+        premBox := box.new(l, rTop, r, eq, border_color = color(na), bgcolor = color.new(bearCol, 92), text = "溢價區 Premium", text_color = color.new(bearCol, 30), text_size = size.small, text_halign = text.align_right, text_valign = text.align_top)
+        discBox := box.new(l, eq, r, rBtm, border_color = color(na), bgcolor = color.new(bullCol, 92), text = "折價區 Discount", text_color = color.new(bullCol, 30), text_size = size.small, text_halign = text.align_right, text_valign = text.align_bottom)
+        eqLine  := line.new(l, eq, r, eq, color = color.gray, style = line.style_dashed)
+    else
+        premBox.set_lefttop(l, rTop)
+        premBox.set_rightbottom(r, eq)
+        discBox.set_lefttop(l, eq)
+        discBox.set_rightbottom(r, rBtm)
+        eqLine.set_xy1(l, eq)
+        eqLine.set_xy2(r, eq)
+
+// ─────────────────────────── 前日 / 前週高低點 ───────────────────────────
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[pwh, pwl] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+var array<line>  lvLines  = array.new<line>()
+var array<label> lvLabels = array.new<label>()
+f_level(int i, float y, string txt, color col) =>
+    if lvLines.size() <= i
+        lvLines.push(line.new(bar_index, y, bar_index + 1, y, color = col, style = line.style_dashed))
+        lvLabels.push(label.new(bar_index, y, txt, color = color(na), textcolor = col, style = label.style_label_left, size = size.tiny))
+    line ln = lvLines.get(i)
+    ln.set_xy1(bar_index - 30, y)
+    ln.set_xy2(bar_index + 20, y)
+    lvLabels.get(i).set_xy(bar_index + 20, y)
+    true
+
+if showLevels and barstate.islast
+    f_level(0, pdh, "前日高 PDH", color.new(color.orange, 20))
+    f_level(1, pdl, "前日低 PDL", color.new(color.orange, 20))
+    f_level(2, pwh, "前週高 PWH", color.new(color.purple, 20))
+    f_level(3, pwl, "前週低 PWL", color.new(color.purple, 20))
+
+// ─────────────────────────── 交易信號 ───────────────────────────
+// 規則：價格第一次回到「未被突破的訂單塊」＋ 以下過濾條件都通過
+//   · 順波段趨勢（可關）
+//   · 做多在折價區、做空在溢價區（可關）
+//   · 大週期同向（預設不強制，只在 JSON 裡回報 trend_aligned）
+//   · 停損距離在最小 / 最大停損 % 之間
+// 停損 = 訂單塊外側 ± ATR 緩衝；止盈由 server.py 以 1:1 設定
+Zone bHit = f_touch(bullOB)
+Zone sHit = f_touch(bearOB)
+
+bool  longSig  = false
+bool  shortSig = false
+float sigEntry = na
+float sigSl    = na
+
+if sigOn and barstate.isconfirmed and not na(bHit)
+    float sl    = math.round_to_mintick(bHit.btm - nz(atr) * slBuffer)
+    float slPct = (close - sl) / close * 100
+    if (not sigTrend or sw.trend == 1) and (not sigZone or close < eq) and (not sigHtfOnly or htfTrend == 1) and slPct >= minSlPct and slPct <= maxSlPct
+        longSig  := true
+        sigEntry := close
+        sigSl    := sl
+
+if sigOn and barstate.isconfirmed and not na(sHit)
+    float sl    = math.round_to_mintick(sHit.top + nz(atr) * slBuffer)
+    float slPct = (sl - close) / close * 100
+    if (not sigTrend or sw.trend == -1) and (not sigZone or close > eq) and (not sigHtfOnly or htfTrend == -1) and slPct >= minSlPct and slPct <= maxSlPct
+        shortSig := true
+        sigEntry := close
+        sigSl    := sl
+
+// 同一根 K 棒多空信號衝突 → 都不做
+if longSig and shortSig
+    longSig  := false
+    shortSig := false
+
+if longSig or shortSig
+    float tp = longSig ? sigEntry + (sigEntry - sigSl) : sigEntry - (sigSl - sigEntry)
+    line.new(bar_index, sigEntry, bar_index + 15, sigEntry, color = color.gray)
+    line.new(bar_index, sigSl, bar_index + 15, sigSl, color = bearCol, style = line.style_dashed)
+    line.new(bar_index, tp, bar_index + 15, tp, color = bullCol, style = line.style_dashed)
+    label.new(bar_index + 15, sigSl, "SL", color = color(na), textcolor = bearCol, style = label.style_label_left, size = size.tiny)
+    label.new(bar_index + 15, tp, "TP 1:1", color = color(na), textcolor = bullCol, style = label.style_label_left, size = size.tiny)
+
+plotshape(longSig, "做多信號", shape.labelup, location.belowbar, bullCol, text = "多", textcolor = color.white, size = size.small)
+plotshape(shortSig, "做空信號", shape.labeldown, location.abovebar, bearCol, text = "空", textcolor = color.white, size = size.small)
+
+// Webhook：只有交易信號會用 alert()，避免把結構通知送進下單機器人
+if longSig
+    alert(f_json("buy", sigEntry, sigSl, htfTrend == 1), alert.freq_once_per_bar_close)
+if shortSig
+    alert(f_json("sell", sigEntry, sigSl, htfTrend == -1), alert.freq_once_per_bar_close)
+
+// 手機通知用（不要接 Webhook）
+alertcondition(swSig == 2, "多方 CHoCH（波段）", "{{ticker}} 出現多方 CHoCH，趨勢可能轉多")
+alertcondition(swSig == -2, "空方 CHoCH（波段）", "{{ticker}} 出現空方 CHoCH，趨勢可能轉空")
+alertcondition(swSig == 1, "多方 BOS（波段）", "{{ticker}} 多方 BOS，多頭延續")
+alertcondition(swSig == -1, "空方 BOS（波段）", "{{ticker}} 空方 BOS，空頭延續")
+alertcondition(sweepHi, "掃高", "{{ticker}} 掃掉波段高點流動性")
+alertcondition(sweepLo, "掃低", "{{ticker}} 掃掉波段低點流動性")
+alertcondition(longSig, "做多信號", "{{ticker}} SMC 做多信號 @ {{close}}")
+alertcondition(shortSig, "做空信號", "{{ticker}} SMC 做空信號 @ {{close}}")
+
+// ─────────────────────────── 儀表板 ───────────────────────────
+var table dash = table.new(position.top_right, 2, 7, bgcolor = color.new(#131722, 10), border_color = color.new(color.gray, 70), border_width = 1)
+if showDash and barstate.islast
+    string zoneTxt = na(eq) ? "—" : close > eq ? "溢價區（偏空）" : "折價區（偏多）"
+    color  zoneCol = na(eq) ? color.gray : close > eq ? bearCol : bullCol
+    dash.cell(0, 0, "賽克斯 SMC", text_color = color.white, text_size = size.small)
+    dash.cell(1, 0, syminfo.ticker, text_color = color.white, text_size = size.small)
+    dash.cell(0, 1, "大週期 " + htfTf, text_color = color.silver, text_size = size.small)
+    dash.cell(1, 1, f_trendTxt(htfTrend), text_color = f_trendCol(htfTrend), text_size = size.small)
+    dash.cell(0, 2, "波段結構", text_color = color.silver, text_size = size.small)
+    dash.cell(1, 2, f_trendTxt(sw.trend), text_color = f_trendCol(sw.trend), text_size = size.small)
+    dash.cell(0, 3, "內部結構", text_color = color.silver, text_size = size.small)
+    dash.cell(1, 3, f_trendTxt(it.trend), text_color = f_trendCol(it.trend), text_size = size.small)
+    dash.cell(0, 4, "價格位置", text_color = color.silver, text_size = size.small)
+    dash.cell(1, 4, zoneTxt, text_color = zoneCol, text_size = size.small)
+    dash.cell(0, 5, "訂單塊 多 / 空", text_color = color.silver, text_size = size.small)
+    dash.cell(1, 5, str.tostring(bullOB.size()) + " / " + str.tostring(bearOB.size()), text_color = color.white, text_size = size.small)
+    dash.cell(0, 6, "未補 FVG", text_color = color.silver, text_size = size.small)
+    dash.cell(1, 6, str.tostring(fvgs.size()), text_color = color.white, text_size = size.small)
