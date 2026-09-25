@@ -300,10 +300,37 @@ var fvgs = array.new<Zone>()
 
 updateZones(fvgs)
 
+// 連續出現的同方向 FVG 合併成一個（上下緣取最外側）
+var int lastBullFvgBar = na
+var int lastBearFvgBar = na
+
+mergeFvg(array<Zone> zs, bool bull, float top, float btm) =>
+    z = zs.get(zs.size() - 1)
+    z.top := math.max(z.top, top)
+    z.btm := math.min(z.btm, btm)
+    box.set_top(z.bx, z.top)
+    box.set_bottom(z.bx, z.btm)
+    box.set_right(z.bx, bar_index)
+
+canMerge(array<Zone> zs, int lastBar, bool bull) =>
+    ok = false
+    if not na(lastBar) and bar_index - lastBar == 1 and zs.size() > 0
+        z = zs.get(zs.size() - 1)
+        ok := z.bull == bull and z.active
+    ok
+
 if showFVG and low > high[2]
-    fvgs.push(Zone.new(box.new(bar_index - 2, low, bar_index, high[2], border_color = color(na), bgcolor = fvgBullCol, text = "FVG", text_color = color.new(#2962FF, 30), text_size = size.tiny), low, high[2], true))
+    if canMerge(fvgs, lastBullFvgBar, true)
+        mergeFvg(fvgs, true, low, high[2])
+    else
+        fvgs.push(Zone.new(box.new(bar_index - 2, low, bar_index, high[2], border_color = color(na), bgcolor = fvgBullCol, text = "FVG", text_color = color.new(#2962FF, 30), text_size = size.tiny), low, high[2], true))
+    lastBullFvgBar := bar_index
 if showFVG and high < low[2]
-    fvgs.push(Zone.new(box.new(bar_index - 2, low[2], bar_index, high, border_color = color(na), bgcolor = fvgBearCol, text = "FVG", text_color = color.new(#FF9800, 30), text_size = size.tiny), low[2], high, false))
+    if canMerge(fvgs, lastBearFvgBar, false)
+        mergeFvg(fvgs, false, low[2], high)
+    else
+        fvgs.push(Zone.new(box.new(bar_index - 2, low[2], bar_index, high, border_color = color(na), bgcolor = fvgBearCol, text = "FVG", text_color = color.new(#FF9800, 30), text_size = size.tiny), low[2], high, false))
+    lastBearFvgBar := bar_index
 
 trimZones(fvgs, fvgMax)
 
